@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:image/image.dart' as img;
@@ -16,131 +17,63 @@ class LiveCameraPage extends StatefulWidget {
 
 class _LiveCameraPageState extends State<LiveCameraPage> {
   CameraController? _cameraController;
-  late WebSocketChannel _channel;
+  WebSocketChannel? _channel;
   bool _isSending = false;
   int frameSkip = 0;
 
   int smallCount = 0;
   int bigCount = 0;
   int totalCount = 0;
+
   List<dynamic> detectedBoxes = [];
-  Size? previewSize;
   double frameW = 0, frameH = 0;
 
-
-
-  // Added for better error handling
   bool _isInitialized = false;
   String? _initError;
+  bool _isConnecting = true;
 
   @override
   void initState() {
     super.initState();
-    _isInitialized = false;
-    _initError = null;
+    // Force landscape orientation
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeRight,
+      DeviceOrientation.landscapeLeft,
+    ]);
+    
     initWebSocket();
-    // ✅ Request permissions first, then init camera
     requestPermissions().then((granted) {
-      print("Initial permission result: $granted");  // ✅ Debug log
-      if (granted && mounted) {
-        initCamera();
-      } else if (mounted) {
-        setState(() {
-          _initError = "Camera permission denied. Please grant access to use live detection.";
-        });
-      }
+      if (granted) initCamera();
+      else setState(() => _initError = "Camera permission denied.");
     });
   }
 
   @override
   void dispose() {
+    // Reset orientation when leaving
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+      DeviceOrientation.landscapeRight,
+      DeviceOrientation.landscapeLeft,
+    ]);
     _cameraController?.dispose();
-    _channel.sink.close();
+    _channel?.sink.close();
     super.dispose();
   }
 
-  // ✅ Enhanced: Request camera permission with rationale dialog
-  Future<bool> requestPermissions() async {
-    try {
-      // Check current status
-      var status = await Permission.camera.status;
-      print("Current camera status: $status");  // ✅ Debug log
-
-      if (status.isGranted) {
-        print("Camera permission already granted");
-        return true;
-      }
-
-      if (status.isDenied) {
-        // ✅ Show rationale dialog before requesting
-        final shouldRequest = await _showPermissionRationale();
-        if (!shouldRequest) return false;
-
-        // Now request
-        status = await Permission.camera.request();
-        print("After request status: $status");  // ✅ Debug log
-      }
-
-      if (status.isPermanentlyDenied) {
-        print("Permission permanently denied, opening settings");
-        await openAppSettings();
-        // Wait a bit for user to return, then re-check
-        await Future.delayed(const Duration(seconds: 2));
-        status = await Permission.camera.status;
-        print("Status after settings: $status");  // ✅ Debug log
-      }
-
-      return status.isGranted;
-    } catch (e) {
-      print("Permission request error: $e");
-      return false;
-    }
-  }
-
-  // ✅ Fixed: Show user-friendly rationale dialog (explicit await and null handling)
-  Future<bool> _showPermissionRationale() async {
-    // ✅ Explicitly await the dialog and handle null as false
-    final result = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,  // Force user to decide
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text("Camera Access Needed"),
-          content: const Text(
-            "This app requires camera permission to perform live vehicle detection from your camera feed. "
-            "The video is processed securely on your device and sent to the backend for analysis. "
-            "Without this, live mode won't work.",
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),  // Deny
-              child: const Text("Deny"),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.of(context).pop(true),  // Allow
-              child: const Text("Grant Permission"),
-            ),
-          ],
-        );
-      },
-    );
-
-    // ✅ Coerce null (dismissed) to false for non-nullable return
-    return result ?? false;
-  }
-
-  // ✅ Initialize WebSocket (unchanged)
   void initWebSocket() {
     try {
       _channel = WebSocketChannel.connect(
-        Uri.parse("ws://192.168.10.4:8000/ws"),  // Change to your PC IP if on physical device
+        Uri.parse("ws://192.168.10.4:8000/ws"),
       );
+      print("WebSocket connecting...");
 
-      _channel.stream.listen(
+      _channel!.stream.listen(
         (data) {
           try {
             final decoded = jsonDecode(data);
-
+            print("Received: total=${decoded['total']}, boxes=${decoded['boxes']?.length}, frameW=${decoded['frame_width']}, frameH=${decoded['frame_height']}");
             if (mounted) {
               setState(() {
                 smallCount = decoded["small"] ?? 0;
@@ -148,51 +81,46 @@ class _LiveCameraPageState extends State<LiveCameraPage> {
                 totalCount = decoded["total"] ?? 0;
                 frameW = decoded["frame_width"]?.toDouble() ?? 0;
                 frameH = decoded["frame_height"]?.toDouble() ?? 0;
-                detectedBoxes = decoded["boxes"];  
+                detectedBoxes = decoded["boxes"] ?? [];
+                _isConnecting = false;
               });
             }
           } catch (e) {
-            print("JSON decode error: $e");
+            print("JSON error: $e");
           }
         },
         onError: (error) {
           print("WebSocket error: $error");
-          if (mounted && _initError == null) {
+          if (mounted) {
             setState(() {
-              _initError = "WebSocket connection failed: $error";
+              _initError = "Connection lost: $error. Check backend IP/port.";
+              _isConnecting = false;
             });
           }
         },
         onDone: () {
           print("WebSocket closed");
+          if (mounted) setState(() => _isConnecting = false);
         },
       );
-
     } catch (e) {
       print("WebSocket init error: $e");
-      if (mounted) {
-        setState(() {
-          _initError = "Failed to connect to WebSocket: $e";
-        });
-      }
+      if (mounted) setState(() => _initError = "WebSocket failed: $e");
     }
   }
 
-  // ✅ Initialize Camera (unchanged but with log)
+  Future<bool> requestPermissions() async {
+    var status = await Permission.camera.status;
+    if (status.isGranted) return true;
+    status = await Permission.camera.request();
+    return status.isGranted;
+  }
+
   Future<void> initCamera() async {
     try {
-      // Double-check permission before proceeding
-      if (!await Permission.camera.isGranted) {
-        throw Exception("Camera permission not granted");
-      }
-
-      print("Starting camera initialization...");  // ✅ Debug log
-
-      // Check for available cameras
       final cameras = await availableCameras();
-      if (cameras.isEmpty) {
-        throw Exception("No cameras available. Try a physical device.");
-      }
+      if (cameras.isEmpty) throw "No cameras available.";
+
       final camera = cameras.first;
 
       _cameraController = CameraController(
@@ -204,61 +132,38 @@ class _LiveCameraPageState extends State<LiveCameraPage> {
 
       await _cameraController!.initialize();
 
-      previewSize = Size(
-  _cameraController!.value.previewSize!.height,
-  _cameraController!.value.previewSize!.width,
-);
+      print("Camera initialized - Sensor orientation: ${camera.sensorOrientation}");
+      print("Preview size: ${_cameraController!.value.previewSize}");
 
       if (!mounted) return;
 
-      print("Camera initialized successfully!");  // ✅ Debug log
+      setState(() => _isInitialized = true);
 
-      setState(() {
-        _isInitialized = true;
-        _initError = null; // Clear any previous errors
-      });
-
-      // ✅ Start streaming with delay (prevents freeze)
-      Future.delayed(const Duration(milliseconds: 300), () {
-        if (mounted && _isInitialized) {
-          startImageStream();
-        }
-      });
-
+      Future.delayed(const Duration(milliseconds: 300), startImageStream);
     } catch (e) {
-      print("Camera init error: $e");
       if (mounted) {
         setState(() {
-          _initError = "Camera initialization failed: $e\n\nTips:\n- Ensure permissions are granted.\n- Use a physical device (emulators often fail).\n- Check AndroidManifest.xml for camera permission.";
-          _isInitialized = false;
+          _initError = "Camera initialization error: $e";
         });
       }
     }
   }
 
-  // ✅ Start image stream safely (unchanged)
   void startImageStream() {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      print("Camera not ready");
-      return;
-    }
-
-    print("Starting image stream...");  // ✅ Debug log
+    if (_cameraController == null) return;
 
     _cameraController!.startImageStream((CameraImage image) async {
-      // ✅ Skip some frames to avoid overloading backend (every 3rd frame)
       frameSkip++;
       if (frameSkip % 3 != 0) return;
-
       if (_isSending) return;
+
       _isSending = true;
 
       try {
         Uint8List jpeg = await convertYUV420toJPEG(image);
-
         if (jpeg.isNotEmpty) {
           final base64Image = base64Encode(jpeg);
-          _channel.sink.add(base64Image);
+          _channel?.sink.add(base64Image);
         }
       } catch (e) {
         print("Frame send error: $e");
@@ -268,54 +173,35 @@ class _LiveCameraPageState extends State<LiveCameraPage> {
     });
   }
 
-  // ✅ YUV420 to JPEG conversion (unchanged)
   Future<Uint8List> convertYUV420toJPEG(CameraImage image) async {
     try {
-      final int width = image.width;
-      final int height = image.height;
+      final width = image.width;
+      final height = image.height;
 
-      // Plane Y (luminance)
-      final Plane planeY = image.planes[0];
-      final Plane planeU = image.planes[1];
-      final Plane planeV = image.planes[2];
+      final y = image.planes[0].bytes;
+      final u = image.planes[1].bytes;
+      final v = image.planes[2].bytes;
 
-      final Uint8List yBuffer = planeY.bytes;
-      final Uint8List uBuffer = planeU.bytes;
-      final Uint8List vBuffer = planeV.bytes;
+      final rgb = img.Image(width: width, height: height);
 
-      // Create empty RGB image
-      final img.Image rgbImage =
-          img.Image(width: width, height: height);
+      int uvRow = image.planes[1].bytesPerRow;
+      int uvPixel = image.planes[1].bytesPerPixel!;
 
-      int uvRowStride = planeU.bytesPerRow;
-      int uvPixelStride = planeU.bytesPerPixel!;
+      for (int yPos = 0; yPos < height; yPos++) {
+        for (int xPos = 0; xPos < width; xPos++) {
+          int yp = y[yPos * image.planes[0].bytesPerRow + xPos];
+          int up = u[(yPos ~/ 2) * uvRow + (xPos ~/ 2) * uvPixel];
+          int vp = v[(yPos ~/ 2) * uvRow + (xPos ~/ 2) * uvPixel];
 
-      // YUV420 → RGB conversion
-      for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-          int yIndex = y * planeY.bytesPerRow + x;
-
-          int uvIndex = (y ~/ 2) * uvRowStride + (x ~/ 2) * uvPixelStride;
-
-          int yp = yBuffer[yIndex];
-          int up = uBuffer[uvIndex];
-          int vp = vBuffer[uvIndex];
-
-          // Convert YUV to RGB
           int r = (yp + 1.402 * (vp - 128)).clamp(0, 255).toInt();
-          int g = (yp - 0.344136 * (up - 128) - 0.714136 * (vp - 128))
-              .clamp(0, 255)
-              .toInt();
+          int g = (yp - 0.344 * (up - 128) - 0.714 * (vp - 128)).clamp(0, 255).toInt();
           int b = (yp + 1.772 * (up - 128)).clamp(0, 255).toInt();
 
-          rgbImage.setPixelRgb(x, y, r, g, b);
+          rgb.setPixelRgb(xPos, yPos, r, g, b);
         }
       }
 
-      // Convert to JPEG
-      final jpeg = img.encodeJpg(rgbImage, quality: 50);
-
-      return Uint8List.fromList(jpeg);
+      return Uint8List.fromList(img.encodeJpg(rgb, quality: 50));
     } catch (e) {
       print("YUV conversion error: $e");
       return Uint8List(0);
@@ -324,182 +210,299 @@ class _LiveCameraPageState extends State<LiveCameraPage> {
 
   @override
   Widget build(BuildContext context) {
-    // Show error if initialization failed
     if (_initError != null) {
       return Scaffold(
-        appBar: AppBar(title: const Text("Live Camera Detection")),
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(16.0),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.error_outline, size: 64, color: Colors.red),
-                const SizedBox(height: 16),
-                Text(
-                  "Initialization Error",
-                  style: Theme.of(context).textTheme.headlineSmall,
-                ),
-                const SizedBox(height: 8),
-                Text(_initError!, style: const TextStyle(color: Colors.red)),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: () async {
-                    print("Retry button pressed");  // ✅ Debug log
-                    setState(() {
-                      _initError = null;
-                      _isInitialized = false;
-                      _cameraController?.dispose();
-                      _cameraController = null;
-                    });
-                    // ✅ Retry with fresh permission request + rationale
-                    final granted = await requestPermissions();
-                    if (granted && mounted) {
-                      await initCamera();
-                    } else if (mounted) {
+        backgroundColor: Colors.black,
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.error_outline, size: 64, color: Colors.redAccent),
+                  const SizedBox(height: 16),
+                  Text(
+                    "Error: $_initError",
+                    style: const TextStyle(color: Colors.redAccent, fontSize: 18),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 16),
+                  ElevatedButton(
+                    onPressed: () {
                       setState(() {
-                        _initError = "Permission still denied. Check device settings and try again.";
+                        _initError = null;
+                        _isInitialized = false;
+                        _isConnecting = true;
+                        _cameraController?.dispose();
+                        _cameraController = null;
+                        detectedBoxes.clear();
+                        smallCount = bigCount = totalCount = 0;
                       });
-                    }
-                  },
-                  child: const Text("Retry & Request Permissions"),
-                ),
-                const SizedBox(height: 8),
-                TextButton(
-                  onPressed: () async {
-                    print("Opening app settings");  // ✅ Debug log
-                    await openAppSettings();
-                  },
-                  child: const Text("Open App Settings"),
-                ),
-              ],
+                      initWebSocket();
+                      requestPermissions().then((granted) {
+                        if (granted) initCamera();
+                      });
+                    },
+                    child: const Text("Retry"),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
       );
     }
 
-    // Show loading if not initialized
-    if (!_isInitialized || _cameraController == null || !_cameraController!.value.isInitialized) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
+    if (!_isInitialized) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: const Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CircularProgressIndicator(color: Colors.white),
+              SizedBox(height: 16),
+              Text("Initializing camera...", style: TextStyle(color: Colors.white)),
+            ],
+          ),
+        ),
       );
     }
 
     return Scaffold(
-      appBar: AppBar(title: const Text("Live Camera Detection")),
+      backgroundColor: Colors.black,
       body: Stack(
         children: [
-          CameraPreview(_cameraController!),
+          // Camera Preview - Full screen
+          Positioned.fill(
+            child: CameraPreview(_cameraController!),
+          ),
 
-          // ✅ Draw bounding boxes
-        if (previewSize != null && frameW != 0)
-      CustomPaint(
-        painter: BoxPainter(
-          detectedBoxes,
-          previewSize!,
-          frameW,
-          frameH,
-        ),
-        size: Size.infinite,
-      ),
-      ////////////////////////////////
-      ///
-      ///
-          Positioned(
-            top: 30,
-            left: 20,
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.black54,
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Text(
-                "Total: $totalCount\nSmall: $smallCount\nBig: $bigCount",
-                style: const TextStyle(color: Colors.white, fontSize: 18),
+          // Bounding Boxes Overlay
+          if (frameW > 0 && frameH > 0 && detectedBoxes.isNotEmpty)
+            Positioned.fill(
+              child: CustomPaint(
+                painter: BoxPainter(
+                  detectedBoxes,
+                  frameW,
+                  frameH,
+                ),
               ),
             ),
-          )
+
+          // Glass App Bar
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: _buildGlassAppBar(context),
+          ),
+
+          // Stats Card
+          Positioned(
+            bottom: 30,
+            left: 20,
+            right: 20,
+            child: _buildStatsCard(_isConnecting),
+          ),
         ],
       ),
     );
   }
-}
 
+  Widget _buildGlassAppBar(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            Colors.black.withOpacity(0.65),
+            Colors.black.withOpacity(0.1),
+          ],
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+        ),
+      ),
+      child: SafeArea(
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            GestureDetector(
+              onTap: () => Navigator.pop(context),
+              child: _glassCircle(Icons.arrow_back),
+            ),
+            Expanded(
+              child: Center(
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Text(
+                      "Live Detection ",
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 22,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const CircleAvatar(radius: 5, backgroundColor: Colors.green),
+                  ],
+                ),
+              ),
+            ),
+            _glassCircle(Icons.settings),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _glassCircle(IconData icon) => Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.15),
+          shape: BoxShape.circle,
+        ),
+        child: Icon(icon, color: Colors.white, size: 22),
+      );
+
+  Widget _buildStatsCard(bool isConnecting) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 16),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.45),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white24, width: 1),
+      ),
+      child: isConnecting
+          ? const Center(
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                  ),
+                  SizedBox(width: 8),
+                  Text("Connecting...", style: TextStyle(color: Colors.white, fontSize: 16)),
+                ],
+              ),
+            )
+          : Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _statItem("Total", totalCount, Colors.orangeAccent),
+                _statItem("Small", smallCount, Colors.greenAccent),
+                _statItem("Large", bigCount, Colors.redAccent),
+              ],
+            ),
+    );
+  }
+
+  Widget _statItem(String label, int value, Color color) {
+    return Column(
+      children: [
+        Text(
+          "$value",
+          style: TextStyle(
+            fontSize: 28,
+            fontWeight: FontWeight.bold,
+            color: color,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 16,
+            color: Colors.white.withOpacity(0.85),
+          ),
+        ),
+      ],
+    );
+  }
+}
 
 class BoxPainter extends CustomPainter {
   final List<dynamic> boxes;
-  final Size previewSize;
   final double frameW;
   final double frameH;
 
-  BoxPainter(this.boxes, this.previewSize, this.frameW, this.frameH);
+  BoxPainter(this.boxes, this.frameW, this.frameH);
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (frameW == 0 || frameH == 0) return;
+    if (frameW == 0 || frameH == 0 || boxes.isEmpty) {
+      print("BoxPainter: Skipping - frameW=$frameW, frameH=$frameH, boxes=${boxes.length}");
+      return;
+    }
 
-    // ✅ Scale factors to convert YOLO → camera preview
-    double scaleX = size.width / frameW;
-    double scaleY = size.height / frameH;
+    print("BoxPainter: Drawing ${boxes.length} boxes on canvas ${size.width}x${size.height}, frame ${frameW}x$frameH");
 
-    Paint boxPaint = Paint()
-      ..color = Colors.green
+    // Calculate scale factors
+    final scaleX = size.width / frameW;
+    final scaleY = size.height / frameH;
+
+    print("BoxPainter: Scale factors - scaleX=$scaleX, scaleY=$scaleY");
+
+    final boxPaint = Paint()
+      ..color = Colors.greenAccent.withOpacity(0.8)
       ..strokeWidth = 3
       ..style = PaintingStyle.stroke;
 
-    Paint textBg = Paint()
-      ..color = Colors.black.withOpacity(0.6);
+    final textBg = Paint()..color = Colors.black.withOpacity(0.7);
 
-    for (var box in boxes) {
-      double x1 = box["x1"] * scaleX;
-      double y1 = box["y1"] * scaleY;
-      double x2 = box["x2"] * scaleX;
-      double y2 = box["y2"] * scaleY;
+    for (int i = 0; i < boxes.length; i++) {
+      var box = boxes[i];
+      
+      final x1 = (box["x1"] as num).toDouble() * scaleX;
+      final y1 = (box["y1"] as num).toDouble() * scaleY;
+      final x2 = (box["x2"] as num).toDouble() * scaleX;
+      final y2 = (box["y2"] as num).toDouble() * scaleY;
 
-      // ✅ Draw box
-      Rect rect = Rect.fromLTRB(x1, y1, x2, y2);
+      if (i == 0) {
+        print("BoxPainter: Box 0 - original: (${box["x1"]}, ${box["y1"]}, ${box["x2"]}, ${box["y2"]})");
+        print("BoxPainter: Box 0 - scaled: ($x1, $y1, $x2, $y2)");
+      }
+
+      final rect = Rect.fromLTRB(x1, y1, x2, y2);
       canvas.drawRect(rect, boxPaint);
 
-      // ✅ Draw label
-      final label = "${box['class']} ${(box['conf'] * 100).toInt()}%";
+      final className = box['class_name'] ?? box['class'] ?? 'Unknown';
+      final conf = ((box['confidence'] ?? box['conf'] ?? 0.0) as num).toDouble() * 100;
+      final label = "$className ${conf.toInt()}%";
+
       final textPainter = TextPainter(
         text: TextSpan(
           text: label,
-          style: TextStyle(color: Colors.white, fontSize: 14),
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+          ),
         ),
         textDirection: TextDirection.ltr,
       );
 
-      textPainter.layout();
-
-      // Background
-      canvas.drawRect(
-        Rect.fromLTWH(x1, y1 - 20, textPainter.width + 6, 20),
+      textPainter.layout(minWidth: 0, maxWidth: x2 - x1);
+      
+      final bgRect = Rect.fromLTWH(
+        x1,
+        y1 - textPainter.height - 4,
+        textPainter.width + 8,
+        textPainter.height + 4,
+      );
+      
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(bgRect, const Radius.circular(4)),
         textBg,
       );
-
-      textPainter.paint(canvas, Offset(x1 + 3, y1 - 18));
+      
+      textPainter.paint(canvas, Offset(x1 + 4, y1 - textPainter.height - 2));
     }
   }
 
   @override
   bool shouldRepaint(BoxPainter oldDelegate) => true;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
